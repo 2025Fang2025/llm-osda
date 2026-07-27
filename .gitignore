@@ -1,0 +1,5 @@
+.DS_Store
+outputs/
+data/*.jsonl
+__pycache__/
+*.pyc

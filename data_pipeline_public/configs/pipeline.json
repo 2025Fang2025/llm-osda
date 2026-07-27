@@ -1,0 +1,54 @@
+{
+  "project": {
+    "seed": 42,
+    "max_turns": 4,
+    "n_profiles": 3000,
+    "topics_per_profile": 5,
+    "train_test_split": {
+      "train": 12000,
+      "test": 3000
+    },
+    "output_language": "en"
+  },
+  "gateway": {
+    "base_url": "YOUR_LLM_API_BASE_URL",
+    "api_key": "YOUR_API_KEY"
+  },
+  "models": {
+    "dialogue_user": {
+      "endpoint": "/v1/chat/completions",
+      "model": "gpt-4",
+      "format": "chat"
+    },
+    "dialogue_assistant": {
+      "endpoint": "/anthropic/v1/messages",
+      "model": "claude-3-opus",
+      "format": "anthropic",
+      "no_temperature": true
+    },
+    "counterfactual_generator": {
+      "endpoint": "/anthropic/v1/messages",
+      "model": "claude-3-opus",
+      "format": "anthropic",
+      "no_temperature": true
+    },
+    "judge": {
+      "endpoint": "/v1/responses",
+      "model": "gpt-4",
+      "format": "responses"
+    }
+  },
+  "ads": {
+    "n_ads": 100,
+    "n_categories": 50,
+    "ads_per_category": 2,
+    "source": "Amazon-Reviews-2023",
+    "k_retrieve": 2,
+    "k_random_irrelevant": 1
+  },
+  "rate_limit": {
+    "max_concurrency": 2,
+    "retry_max": 8,
+    "retry_base_sleep": 4
+  }
+}
