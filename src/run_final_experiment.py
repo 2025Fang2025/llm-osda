@@ -34,10 +34,12 @@ from src.eval.closed_loop_eval import (
     aggregate_results,
     batch_evaluate,
 )
+from src.data.horizon import HORIZON, validate_dialogue, validate_dialogue_mixed
+from src.eval.dedup import artifact_identity, dump_stats, save_cache
 from src.generation.sft_proxy import SoftInsertionRenderer
 from src.generation.base_llm_renderer import BaseLLMRenderer, BaseTemplateRenderer
 from src.models.text_mlp import train_unified_user_model, UnifiedUserModel
-from src.policy.stop_policy import StopState, stop_features_from_auction, train_stop_policy, StopPolicy
+from src.policy.stop_policy import StopState, stop_features_v2, train_stop_policy, StopPolicy
 from src.user_simulator.judge_proxy import UserJudgeProxy
 from src.utils.io import ensure_dir, load_jsonl, save_json, save_jsonl, resolve_device, set_seed
 from src.utils.plotting import plot_all_training_curves, plot_unified_user_model_curves, plot_stop_policy_curves
@@ -105,25 +107,24 @@ def immediate_reward_for_train_state(dialogue, turn_number, auction_result, auct
     }
 
 
-def build_stop_training_states(train_dialogues, pctr_model, renderer, judge_proxy, lambda_gamma, gamma=0.95, theta_min=0.1, theta_max=4.1, randomize_bids=True, bid_noise_ratio=0.5, seed=42):
+def build_stop_training_states(train_dialogues, pctr_model, renderer, judge_proxy, lambda_gamma, gamma=0.95, theta_min=0.1, theta_max=4.1, randomize_bids=True, bid_noise_ratio=0.5, seed=42, mixed_horizon=False):
     import random as _rng
     _rng.seed(seed)
     states_by_session = defaultdict(list)
     for d in tqdm(train_dialogues, desc="build Bellman states"):
         n_turns = max(1, int(d.get("n_turns", len(d.get("turns", [])) or 1)))
+        # Mixed-horizon training keeps T=1/2/3 sessions in one pool; the realized
+        # T only shapes the Bellman target, never the 12-dim feature vector.
+        (validate_dialogue_mixed if mixed_horizon else validate_dialogue)(d)
+        # Bids are committed for the whole trajectory, as in mechanism replay.
+        ads = [dict(ad) for ad in d.get("candidate_ads", [])]
+        if randomize_bids:
+            for ad in ads:
+                orig = float(ad.get("bid", 1.0))
+                ad["bid"] = _rng.uniform(max(0.01, orig * (1.0 - bid_noise_ratio)),
+                                          orig * (1.0 + bid_noise_ratio))
         for idx, turn in enumerate(d.get("turns", [])):
             tn = int(turn.get("turn", idx + 1))
-            ads = d.get("candidate_ads", [])
-
-            # Randomize bids to prevent Stop Policy from memorizing ad-specific bid values
-            if randomize_bids:
-                ads = [dict(a) for a in ads]
-                for a in ads:
-                    orig = float(a.get("bid", 1.0))
-                    lo = max(0.01, orig * (1.0 - bid_noise_ratio))
-                    hi = orig * (1.0 + bid_noise_ratio)
-                    a["bid"] = _rng.uniform(lo, hi)
-
             pctrs = predict_pctrs_for_dialogue_turn(pctr_model, d, tn)
             # Mechanism fix: stop-policy Bellman target should use
             # W_t=max_i psi(b_i)q_i(h_t), not local Myerson payment/revenue.
@@ -155,7 +156,7 @@ def build_stop_training_states(train_dialogues, pctr_model, renderer, judge_prox
                 "gamma_score": 1.0,
                 "revenue": 0.0,
             }
-            features = stop_features_from_auction(tn, n_turns, auction_meta)
+            features = stop_features_v2(tn, auction_meta)
             auction_meta.update(feedback)
             states_by_session[d["session_id"]].append(StopState(
                 session_id=d["session_id"], turn=tn, n_turns=n_turns,
@@ -165,6 +166,12 @@ def build_stop_training_states(train_dialogues, pctr_model, renderer, judge_prox
 
 
 def main():
+    # Render/judge de-duplication: identical (session, turn, ad, renderer)
+    # requests are served from one cache, so adding diagnostic policies costs
+    # no extra LLM calls.  Must be installed before any evaluation runs.
+    from src.eval.dedup import install_dedup
+    install_dedup()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -191,6 +198,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="LLM-OSDA final closed-loop training/evaluation")
     parser.add_argument("--dialogues", required=True)
+    parser.add_argument("--profiles", default="", help="Original profiles_.jsonl when subset is in another directory")
+    parser.add_argument("--renderer_temperature", type=float, default=0.0, help="Deterministic default for paired cached evaluation")
     parser.add_argument("--counterfactuals", required=True)
     parser.add_argument("--sft", required=True)
     parser.add_argument("--output_dir", default="outputs/final_closed_loop")
@@ -198,6 +207,9 @@ def main():
                         help="Eval-mode only: load models from here instead of output_dir "
                              "(e.g. a round_N subdir). Splits/results still use output_dir.")
     parser.add_argument("--mode", choices=["train", "eval", "all"], default="all")
+    parser.add_argument("--mixed_horizon_train", action="store_true",
+                        help="Train StopNet on a pool that mixes T=1/2/3 sessions. "
+                             "Evaluation is never mixed, so this requires --mode train.")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--test_ratio", type=float, default=0.2)
@@ -262,7 +274,7 @@ def main():
     sft_rows = load_jsonl(args.sft)
 
     # Load user profiles — short text for Judge, build user_id_map for learnable embedding
-    profiles_path = Path(args.dialogues).parent / "profiles_.jsonl"
+    profiles_path = Path(args.profiles) if args.profiles else Path(args.dialogues).parent / "profiles_.jsonl"
     user_id_map = {}
     if profiles_path.exists():
         profiles_raw = {p["profile_id"]: p for p in load_jsonl(str(profiles_path))}
@@ -406,6 +418,12 @@ def main():
     }, output_dir / "data_summary.json")
 
     # --- Rounds ---
+    if args.mixed_horizon_train and args.mode != "train":
+        raise SystemExit(
+            "--mixed_horizon_train requires --mode train. Evaluation must stay inside a "
+            "single horizon stratum, otherwise the forced last-turn auction either "
+            "disappears (t == HORIZON never fires for short sessions) or reads the "
+            "per-session label (t == len(turns)). Run eval separately per stratum.")
     n_train = args.train_rounds if args.mode in ("train", "all") else 0
     n_eval = args.eval_rounds if args.mode in ("eval", "all") else 0
     total_rounds = max(n_train, n_eval)
@@ -488,11 +506,13 @@ def main():
                 train_states = build_stop_training_states(
                     train_dialogues, pctr_model=pctr_model, renderer=None,
                     judge_proxy=None, lambda_gamma=cfg.lambda_gamma, gamma=cfg.discount,
+                    mixed_horizon=args.mixed_horizon_train,
                 )
                 stop_policy, stop_m = train_stop_policy(
                     train_states, device=device, hidden_dim=cfg.stop_hidden_dim,
                     epochs=args.stop_epochs, batch_size=cfg.batch_size, lr=cfg.lr, discount=cfg.discount,
                     patience=args.patience * 2,
+                    horizon=None if args.mixed_horizon_train else HORIZON,
                 )
                 stop_policy.save(round_dir)
                 save_json(stop_m, round_dir / "stop_policy_metrics.json")
@@ -614,11 +634,13 @@ def main():
                         train_states = build_stop_training_states(
                             train_dialogues, pctr_model=pctr_model, renderer=None,
                             judge_proxy=None, lambda_gamma=cfg.lambda_gamma, gamma=cfg.discount,
+                            mixed_horizon=args.mixed_horizon_train,
                         )
                         stop_policy, stop_m = train_stop_policy(
                             train_states, device=device, hidden_dim=cfg.stop_hidden_dim,
                             epochs=args.stop_epochs, batch_size=cfg.batch_size, lr=cfg.lr,
                             discount=cfg.discount, patience=args.patience * 2,
+                            horizon=None if args.mixed_horizon_train else HORIZON,
                         )
                         stop_policy.save(round_dir)
 
@@ -706,18 +728,18 @@ def main():
                     from src.generation.llm_renderer import TrainedLLMRenderer
                     trained_renderer = TrainedLLMRenderer(
                         base_model=args.base_model, adapter_dir=adapter_dir, device=device,
-                        max_new_tokens=args.llm_max_new_tokens, temperature=0.2, top_p=0.9,
+                        max_new_tokens=args.llm_max_new_tokens, temperature=args.renderer_temperature, top_p=0.9,
                         load_in_4bit=args.llm_load_in_4bit,
                     )
                 else:
                     from src.generation.base_llm_renderer import BaseLLMRenderer as _FullSFT
                     trained_renderer = _FullSFT(
                         base_model=adapter_dir, device=device,
-                        max_new_tokens=args.llm_max_new_tokens, temperature=0.2, top_p=0.9,
+                        max_new_tokens=args.llm_max_new_tokens, temperature=args.renderer_temperature, top_p=0.9,
                     )
                 untrained_renderer = BaseLLMRenderer(
                     base_model=args.base_model, device=device,
-                    max_new_tokens=args.llm_max_new_tokens, temperature=0.2, top_p=0.9,
+                    max_new_tokens=args.llm_max_new_tokens, temperature=args.renderer_temperature, top_p=0.9,
                 )
                 renderer_setup = "trained_lora" if args.use_lora else "trained_full_sft"
 
@@ -731,6 +753,20 @@ def main():
             else:
                 user_judge = UserJudgeProxy(label_map, judge_model, use_exact_labels=args.use_exact_judge_labels, user_id_map=user_id_map)
                 judge_setup = "proxy" + ("_exact" if args.use_exact_judge_labels else "")
+
+            # Judge identity includes checkpoint/encoder artifacts, exact labels and
+            # profile mapping. A fresh judge object is made after each training round.
+            import hashlib
+            judge_files = [model_dir / "user_model.pt", model_dir / "text_encoder_meta.json",
+                           model_dir / "text_encoder_tfidf.joblib"]
+            user_judge.cache_identity = {
+                "artifacts": artifact_identity(*judge_files), "mode": judge_setup,
+                "profiles": user_id_map,
+                "labels": hashlib.sha256(Path(args.counterfactuals).read_bytes()).hexdigest()
+                          if args.use_exact_judge_labels else None,
+                "llm": artifact_identity(args.base_model) if args.judge_mode == "local_llm" else None,
+                "max_new_tokens": getattr(user_judge, "max_new_tokens", None),
+            }
 
             log_step("[eval 3/4] Closed-loop evaluation ...")
             log.info(f"  Eval batch_size={args.eval_batch_size}, sessions={len(test_dialogues)}")
@@ -751,6 +787,7 @@ def main():
                 vllm_trained_model=adapter_dir if (args.use_vllm and adapter_dir) else None,
                 vllm_untrained_model=args.base_model if args.use_vllm else None,
                 vllm_max_new_tokens=args.llm_max_new_tokens,
+                renderer_temperature=args.renderer_temperature,
             )
 
             session_df = pd.DataFrame(rows)
@@ -765,6 +802,8 @@ def main():
             log.info("\n" + summary_df.to_string(index=False))
             log.info(f"  Outputs: {round_dir}")
 
+    save_cache()
+    dump_stats(output_dir / "dedup_stats.json")
     total_time = time.time() - t_start
     log.info(f"All done in {total_time:.0f}s ({total_time/60:.1f}min). Results in: {output_dir}")
 

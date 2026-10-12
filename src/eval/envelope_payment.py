@@ -97,6 +97,7 @@ def estimate_expected_click_allocation(
             psi_mode="identity",
             theta_max=theta_max,
             pctr_cache=pctr_cache,
+            gamma=gamma,
         )
 
         if chosen_turn is None or result is None:

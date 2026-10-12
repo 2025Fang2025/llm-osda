@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from src.data.horizon import HORIZON, validate_turns
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -40,6 +42,19 @@ class StopState:
 
 
 def stop_features_from_auction(turn_number: int, n_turns: int, auction_meta: Dict[str, Any]) -> List[float]:
+    """LEGACY 14-dim feature map.  Dims 1 (turn/n_turns) and 2 (n_turns/5)
+    leak the realized horizon n_turns, which in this dataset coincides with the
+    realized auction turn (14,207/14,207 sessions have auction_turn == n_turns).
+    Feeding it to StopNet hands the model its own label.  Kept only so that
+    legacy artifacts remain loadable; any evaluated call site must use
+    stop_features_v2.  The guard below makes a missed call site fail loudly
+    instead of silently reproducing the leak.
+    """
+    if os.environ.get("LLM_OSDA_HORIZON"):
+        raise RuntimeError(
+            "stop_features_from_auction (14-dim, leaks n_turns) was called while "
+            "LLM_OSDA_HORIZON is set. Switch this call site to stop_features_v2."
+        )
     scores = np.asarray(auction_meta["scores"], dtype=np.float64)
     pctrs = np.asarray(auction_meta["pctrs"], dtype=np.float64)
     bids = np.asarray(auction_meta["bids"], dtype=np.float64)
@@ -64,6 +79,44 @@ def stop_features_from_auction(turn_number: int, n_turns: int, auction_meta: Dic
         float(np.mean(bids)),
         float(auction_meta["payment"]),
     ]
+
+
+STOP_FEATURE_DIM_V2 = 12
+
+
+def stop_features_v2(turn_number: int, auction_meta: Dict[str, Any]) -> List[float]:
+    """Leak-free 12-dim feature map: the 14-dim map minus turn/n_turns and
+    n_turns/5.  Everything kept here is observable at turn t by a causal
+    policy; nothing reveals the realized horizon.
+
+    Order: turn/5, max_score, second_score, gap,
+           pctr[winner], max pctr, mean pctr, std pctr,
+           bid[winner], max bid, mean bid, payment.
+    """
+    scores = np.asarray(auction_meta["scores"], dtype=np.float64)
+    pctrs = np.asarray(auction_meta["pctrs"], dtype=np.float64)
+    bids = np.asarray(auction_meta["bids"], dtype=np.float64)
+    order = np.argsort(scores)[::-1]
+    max_score = float(scores[order[0]])
+    second_score = float(scores[order[1]]) if len(scores) > 1 else 0.0
+    gap = max_score - second_score
+    winner = int(order[0])
+    feats = [
+        float(turn_number) / 5.0,
+        max_score,
+        second_score,
+        gap,
+        float(pctrs[winner]),
+        float(np.max(pctrs)),
+        float(np.mean(pctrs)),
+        float(np.std(pctrs)),
+        float(bids[winner]),
+        float(np.max(bids)),
+        float(np.mean(bids)),
+        float(auction_meta["payment"]),
+    ]
+    assert len(feats) == STOP_FEATURE_DIM_V2
+    return feats
 
 
 class StopPolicy:
@@ -102,15 +155,38 @@ class StopPolicy:
         return StopPolicy(scaler, model, device)
 
 
-def compute_bellman_targets(states_by_session: Dict[str, List[StopState]], discount: float = 0.95) -> Tuple[np.ndarray, np.ndarray, List[StopState]]:
+def compute_bellman_targets(states_by_session: Dict[str, List[StopState]], discount: float = 0.95, horizon: int | None = HORIZON) -> Tuple[np.ndarray, np.ndarray, List[StopState]]:
     """Exact optimal-stopping Bellman targets on replayed trajectories.
 
     Q(s, AUCTION) = immediate_reward(s)
     Q(s, WAIT) = discount * V(next_state), or 0 at the end.
     V(s) = max(Q(s, AUCTION), Q(s, WAIT))
+
+    horizon=None enables MIXED-HORIZON training: each trajectory terminates at
+    its own realized T, so V_{T_i+1} = 0 is applied per session instead of at one
+    global T.  This is sound as a supervision signal -- the realized T is used to
+    BUILD the Bellman target, never as an input feature (stop_features_v2 is
+    12-dim and carries no n_turns; see tests/test_no_horizon_leak.py).  The guard
+    below is what makes it safe: a trajectory is accepted only if its turns are
+    1..len(states) with no gap AND it actually reaches its recorded n_turns, so a
+    truncated replay can never be mistaken for a terminated one and silently
+    receive a WAIT target of 0.
     """
     X, Y, flat = [], [], []
     for sid, states in states_by_session.items():
+        if horizon is None:
+            observed = [int(st.turn) for st in states]
+            if observed != list(range(1, len(observed) + 1)):
+                raise ValueError(f"session {sid}: turns must be 1..n with no gap, got {observed}")
+            declared = {int(st.n_turns) for st in states}
+            if len(declared) != 1:
+                raise ValueError(f"session {sid}: inconsistent n_turns {sorted(declared)}")
+            if not observed or observed[-1] != declared.pop():
+                raise ValueError(
+                    f"session {sid}: trajectory {observed} does not reach its recorded horizon; "
+                    "truncation is not termination, V_{T+1}=0 would be wrong")
+        else:
+            validate_turns([int(st.turn) for st in states], horizon, sid)
         V_next = 0.0
         q_targets_reversed = []
         for st in reversed(states):
@@ -136,8 +212,9 @@ def train_stop_policy(
     lr: float = 1e-3,
     discount: float = 0.95,
     patience: int = 10,
+    horizon: int | None = HORIZON,
 ) -> Tuple[StopPolicy, Dict[str, Any]]:
-    X, Y, flat_states = compute_bellman_targets(states_by_session, discount=discount)
+    X, Y, flat_states = compute_bellman_targets(states_by_session, discount=discount, horizon=horizon)
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X).astype(np.float32)
     model = StopQNetwork(Xs.shape[1], hidden_dim=hidden_dim).to(device)

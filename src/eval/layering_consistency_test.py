@@ -42,7 +42,7 @@ from src.eval.closed_loop_eval import (
     mechanism_meta_at_turn,
 )
 from src.models.text_mlp import PCTRModel, UnifiedUserModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 from src.utils.io import ensure_dir, load_jsonl, resolve_device, save_json
 
 
@@ -174,7 +174,7 @@ class LLMStopPolicyAdapter:
     """Wraps the trained LLMStopPolicy so it looks like a StopPolicy.
 
     The downstream auction code calls `stop_policy.q_values(features)` where
-    `features` is the 14-dim vector built by `stop_features_from_auction`
+    `features` is the 12-dim leak-free vector built by `stop_features_v2`
     (stop_policy.py:42). features[0] = turn / 5.0 — we recover the turn
     number from there. The current dialogue is set per-session via
     `_set_llm_stop_context()` (the q_values signature provides no other

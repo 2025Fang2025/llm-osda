@@ -73,3 +73,37 @@ class ExportPaperResultsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_missing_triggered_payment_is_not_silently_dropped():
+    import pytest
+    fixture = ExportPaperResultsTest()
+    outcomes = fixture._outcomes()
+    second = outcomes.copy()
+    second['session_id'] = 'missing-session'
+    with pytest.raises(ValueError, match='Missing envelope payments'):
+        build_paper_metrics(pd.concat([outcomes, second]), fixture._payments(), n_bootstrap=10)
+
+
+def test_revision_export_requires_new_rows():
+    import pytest
+    fixture = ExportPaperResultsTest()
+    with pytest.raises(ValueError, match='Missing revision policy'):
+        build_paper_metrics(fixture._outcomes(), fixture._payments(), require_revision=True, n_bootstrap=10)
+
+
+def test_no_trigger_sessions_remain_in_revenue_denominator():
+    fixture = ExportPaperResultsTest()
+    outcomes = fixture._outcomes()
+    outcomes['triggered'] = 1
+    silent = outcomes.copy()
+    silent['session_id'] = 'no-ad'
+    silent['triggered'] = 0
+    silent['winner_bid'] = 0.
+    silent['expected_click'] = 0.
+    silent['click_value'] = 0.
+    silent['gamma_score'] = 1.
+    silent['gross_revenue'] = 0.
+    metrics = build_paper_metrics(pd.concat([outcomes, silent]), fixture._payments(), n_bootstrap=10)
+    assert (metrics.n_sessions == 2).all()
+    assert (metrics.net_revenue == .25).all()

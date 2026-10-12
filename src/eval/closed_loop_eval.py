@@ -8,7 +8,9 @@ import pandas as pd
 from src.auction.auction import run_virtual_value_auction, VirtualValueAuctionResult, run_quality_weighted_allocation
 from src.data.data_utils import pctr_input_text, numeric_features
 from src.models.text_mlp import PCTRModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
+from src.eval.hindsight import hindsight_bellman_turn, HORIZON
+from src.data.horizon import validate_dialogue
 
 
 # Default prior bounds (Uniform). Passed through from config / CLI.
@@ -65,7 +67,7 @@ def compute_cv_minus_winner(
         "second_score": sorted_scores[1] if len(sorted_scores) > 1 else 0.0,
         "payment": 0.0,
     }
-    features_reduced = stop_features_from_auction(turn_number, n_turns, meta_reduced)
+    features_reduced = stop_features_v2(turn_number, meta_reduced)
     q_vals = stop_policy.q_values(features_reduced)
     return max(0.0, float(q_vals[0]))
 
@@ -235,7 +237,6 @@ def _choose_learned_stop_turn(
     pctr_cache: Dict[int, List[float]] | None = None,
 ) -> Tuple[int | None, float, float]:
     turns = dialogue.get("turns", [])
-    n_turns = max(1, int(dialogue.get("n_turns", len(turns) or 1)))
     for idx, turn in enumerate(turns):
         tn = int(turn.get("turn", idx + 1))
         result, meta = mechanism_meta_at_turn(
@@ -244,8 +245,14 @@ def _choose_learned_stop_turn(
         )
         if result is None:
             continue
-        features = stop_features_from_auction(tn, n_turns, meta)
-        is_last = idx == len(turns) - 1
+        features = stop_features_v2(tn, meta)
+        # Horizon boundary, NOT "the last turn of this realized session".
+        # len(turns) is oracle information: a session is short precisely
+        # because the ad was already shown / the user left, so comparing
+        # against it let the mechanism peek at its own outcome.  T is a
+        # global environment constant (max_turns=3 for all 14,918 sessions),
+        # and forcing at t=T is the direct consequence of V_{T+1} == 0.
+        is_last = (tn == HORIZON)
         if force_auction_last_turn and is_last:
             return tn, np.nan, np.nan
         q = stop_policy.q_values(features)
@@ -277,7 +284,7 @@ def _choose_myopic_threshold_turn(
         )
         if result is None:
             continue
-        is_last = idx == len(turns) - 1
+        is_last = (tn == HORIZON)  # horizon constant, not len(turns); see above
         if force_auction_last_turn and is_last:
             return tn
         score = float(meta["winner_bid"]) * float(meta["winner_pctr"])
@@ -297,6 +304,7 @@ def _run_policy_allocation(
     psi_mode: str = "virtual",
     theta_max: float = DEFAULT_THETA_MAX,
     pctr_cache: Dict[int, List[float]] | None = None,
+    gamma: float = 0.95,
 ) -> Tuple[int | None, Any | None, Dict[str, Any], float, float]:
     turns = dialogue.get("turns", [])
     if not turns:
@@ -305,9 +313,9 @@ def _run_policy_allocation(
     q_wait, q_auction = np.nan, np.nan
     if policy_name in ("first_turn", "first_turn_trained_llm"):
         chosen_turn = int(turns[0].get("turn", 1))
-    elif policy_name == "last_turn":
+    elif policy_name in ("last_turn", "last_turn_trained_llm"):
         chosen_turn = int(turns[-1].get("turn", len(turns)))
-    elif policy_name in ("random_turn",):
+    elif policy_name in ("random_turn", "random_turn_trained_llm"):
         if fixed_turn is None:
             raise ValueError("random_turn requires an explicit fixed_turn")
         valid_turns = {
@@ -319,6 +327,24 @@ def _run_policy_allocation(
             raise ValueError(
                 f"random_turn fixed_turn={chosen_turn} is not in {sorted(valid_turns)}"
             )
+    elif policy_name in ("second_turn", "second_turn_trained_llm"):
+        validate_dialogue(dialogue)
+        if HORIZON < 2:
+            raise ValueError(
+                f"policy {policy_name} needs turn 2 but LLM_OSDA_HORIZON={HORIZON}"
+            )
+        chosen_turn = 2
+    elif policy_name == "hindsight_bellman":
+        # Future-informed relaxation: exact backward
+        # induction on the realized W_t path.  UPPER BOUND on any causal
+        # policy (E[max] >= max E).  Never report as "optimal"; never call
+        # the gap to it "regret".
+        chosen_turn, _diag = hindsight_bellman_turn(
+            dialogue, pctr_model, candidate_ads=candidate_ads,
+            psi_mode=psi_mode, theta_max=theta_max, pctr_cache=pctr_cache, gamma=gamma,
+        )
+        if chosen_turn is None:
+            return None, None, _empty_meta(candidate_ads or dialogue.get("candidate_ads", []), []), q_wait, q_auction
     elif policy_name in ("learned_stop", "learned_stop_untrained_llm"):
         if stop_policy is None:
             return None, None, _empty_meta(candidate_ads or dialogue.get("candidate_ads", []), []), q_wait, q_auction
@@ -329,7 +355,7 @@ def _run_policy_allocation(
         )
         if chosen_turn is None:
             return None, None, _empty_meta(candidate_ads or dialogue.get("candidate_ads", []), []), q_wait, q_auction
-    elif policy_name == "myopic_threshold":
+    elif policy_name in ("myopic_threshold", "myopic_threshold_trained_llm"):
         import os
         thr = float(os.environ.get("MYOPIC_THRESHOLD", "0.4"))
         chosen_turn = _choose_myopic_threshold_turn(
@@ -361,6 +387,7 @@ def _wins_under_bid(
     psi_mode: str,
     theta_max: float,
     pctr_cache: Dict[int, List[float]] | None = None,
+    gamma: float = 0.95,
 ) -> bool:
     ads = _ads_with_replaced_bid(dialogue, target_idx, bid)
     _, result, _, _, _ = _run_policy_allocation(
@@ -368,6 +395,7 @@ def _wins_under_bid(
         candidate_ads=ads, fixed_turn=fixed_turn,
         force_auction_last_turn=force_auction_last_turn,
         psi_mode=psi_mode, theta_max=theta_max, pctr_cache=pctr_cache,
+        gamma=gamma,
     )
     return bool(result is not None and int(result.winner_index) == int(target_idx))
 
@@ -385,6 +413,7 @@ def compute_global_critical_cpc(
     theta_max: float = DEFAULT_THETA_MAX,
     n_iter: int = 24,
     pctr_cache: Dict[int, List[float]] | None = None,
+    gamma: float = 0.95,
 ) -> float:
     """Global critical CPC kappa_i(b_-i) via complete mechanism reruns.
 
@@ -394,17 +423,17 @@ def compute_global_critical_cpc(
     if winner_bid <= 0:
         return 0.0
     if _wins_under_bid(policy_name, dialogue, pctr_model, stop_policy, winner_index, 0.0,
-                       fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache):
+                       fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache, gamma):
         return 0.0
     if not _wins_under_bid(policy_name, dialogue, pctr_model, stop_policy, winner_index, winner_bid,
-                           fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache):
+                           fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache, gamma):
         return float(winner_bid)
 
     lo, hi = 0.0, float(winner_bid)
     for _ in range(n_iter):
         mid = (lo + hi) / 2.0
         if _wins_under_bid(policy_name, dialogue, pctr_model, stop_policy, winner_index, mid,
-                           fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache):
+                           fixed_turn, force_auction_last_turn, psi_mode, theta_max, pctr_cache, gamma):
             hi = mid
         else:
             lo = mid
@@ -477,6 +506,8 @@ def settle_episode(
         "winner_score": float(auction_meta["winner_score"]),
         "payment": payment,
         "click_value": click_value,
+        "model_welfare": time_discount * float(auction_meta["winner_score"]),
+        "renderer_group": getattr(renderer, "renderer_tag", "pre_rendered"),
         "time_discount": time_discount,
         "expected_click": expected_click,
         "clicked_binary": int(judge_out["clicked_binary"]),
@@ -509,6 +540,7 @@ def _no_trigger_row(policy_name, dialogue):
         "payment": 0.0, "click_value": 0.0, "clicked_binary": 0,
         "gamma_score": 1.0, "revenue": 0.0, "info_rent": 0.0,
         "gross_revenue": 0.0, "cv_minus_winner": 0.0, "theta_threshold": 0.0,
+        "model_welfare": 0.0,
         "time_discount": 0.0, "expected_click": 0.0,
         "reward": 0.0, "judge_source": "no_ad", "judge_mode": "no_ad",
         "judge_exact": 0, "response_source": "no_ad", "response": "",
@@ -543,6 +575,7 @@ def simulate_first_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy,
         fixed_turn=first_turn, force_auction_last_turn=True,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     if result is None:
         return _no_trigger_row(policy_name, dialogue)
@@ -550,6 +583,7 @@ def simulate_first_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy, result.winner_index,
         float(result.winner_ad.get("bid", 0.0)), fixed_turn=first_turn,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     row = settle_episode(policy_name, dialogue, first_turn, result, meta, renderer, judge, lambda_gamma, gamma=gamma)
     row["q_wait"] = q_wait
@@ -586,6 +620,7 @@ def simulate_random_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy,
         fixed_turn=chosen_turn, force_auction_last_turn=True,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     if result is None:
         return _no_trigger_row(policy_name, dialogue)
@@ -593,6 +628,7 @@ def simulate_random_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy, result.winner_index,
         float(result.winner_ad.get("bid", 0.0)), fixed_turn=chosen_turn,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     row = settle_episode(policy_name, dialogue, chosen_turn, result, meta, renderer, judge, lambda_gamma, gamma=gamma)
     row["q_wait"] = q_wait
@@ -625,6 +661,7 @@ def simulate_last_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy,
         fixed_turn=last_turn, force_auction_last_turn=True,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     if result is None:
         return _no_trigger_row(policy_name, dialogue)
@@ -632,6 +669,7 @@ def simulate_last_turn_auction(
         policy_name, dialogue, pctr_model, stop_policy, result.winner_index,
         float(result.winner_ad.get("bid", 0.0)), fixed_turn=last_turn,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     row = settle_episode(policy_name, dialogue, last_turn, result, meta, renderer, judge, lambda_gamma, gamma=gamma)
     row["q_wait"] = q_wait
@@ -662,6 +700,7 @@ def simulate_learned_stop_policy(
         policy_name, dialogue, pctr_model, stop_policy,
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     if result is None or chosen_turn is None:
         row = _no_trigger_row(policy_name, dialogue)
@@ -673,6 +712,7 @@ def simulate_learned_stop_policy(
         float(result.winner_ad.get("bid", 0.0)), fixed_turn=None,
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity", theta_max=theta_max,
+        gamma=gamma,
     )
     row = settle_episode(policy_name, dialogue, chosen_turn, result, meta, renderer, judge, lambda_gamma, gamma=gamma)
     row["q_wait"] = q_wait
@@ -698,6 +738,7 @@ def aggregate_results(rows: List[Dict[str, Any]]) -> pd.DataFrame:
             "binary_click_rate": float(triggered["clicked_binary"].mean()) if len(triggered) else 0.0,
             "avg_gamma": float(triggered["gamma_score"].mean()) if len(triggered) else 1.0,
             "avg_reward": float(g["reward"].mean()),
+            "avg_model_welfare": float(g["model_welfare"].mean()),
             "avg_payment": float(triggered["payment"].mean()) if len(triggered) else 0.0,
             "avg_winner_bid": float(triggered["winner_bid"].mean()) if len(triggered) else 0.0,
             "avg_winner_pctr": float(triggered["winner_pctr"].mean()) if len(triggered) else 0.0,
@@ -717,7 +758,6 @@ def _resolve_auction_for_policy(
 ):
     """Phase 1: determine auction decision + winner for each policy. No LLM calls."""
     turns = dialogue.get("turns", [])
-    n_turns = max(1, int(dialogue.get("n_turns", len(turns) or 1)))
     results = []
 
     def _auction_at_turn(pname, turn_number):
@@ -732,6 +772,7 @@ def _resolve_auction_for_policy(
             force_auction_last_turn=force_auction_last_turn,
             psi_mode="identity",
             theta_max=DEFAULT_THETA_MAX,
+            gamma=gamma,
         )
         if result is None:
             row = _no_trigger_row(pname, dialogue)
@@ -746,6 +787,7 @@ def _resolve_auction_for_policy(
             force_auction_last_turn=force_auction_last_turn,
             psi_mode="identity",
             theta_max=DEFAULT_THETA_MAX,
+            gamma=gamma,
         )
         meta["payment"] = payment
         return {
@@ -782,6 +824,7 @@ def _resolve_auction_for_policy(
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity",
         theta_max=DEFAULT_THETA_MAX,
+        gamma=gamma,
     )
     if myo_tn is not None:
         results.append(("myopic_threshold", _auction_at_turn("myopic_threshold", myo_tn), "untrained"))
@@ -794,21 +837,58 @@ def _resolve_auction_for_policy(
     # for idx, turn in enumerate(turns):
     #     tn = int(turn.get("turn", idx + 1))
     #     gsp_result, gsp_meta = auction_meta_from_result_gsp(dialogue, tn, pctr_model, 0.0)
-    #     features = stop_features_from_auction(tn, n_turns, gsp_meta)
+    #     features = stop_features_v2(tn, gsp_meta)
     #     ...
     chosen_tn, _, _, _, _ = _run_policy_allocation(
         "learned_stop", dialogue, pctr_model, stop_policy,
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity",
         theta_max=DEFAULT_THETA_MAX,
+        gamma=gamma,
     )
     if chosen_tn is not None:
         results.append(("learned_stop", _auction_at_turn("learned_stop", chosen_tn), "trained"))
     else:
         results.append(("learned_stop", {"row": _no_trigger_row("learned_stop", dialogue), "render_item": None}, "trained"))
 
+    # Fixed t=2 base renderer control.  Turn 2 is only a distinct arm when it is
+    # an INTERIOR turn of the horizon.  At HORIZON == 2 it is the same decision as
+    # last_turn (two identical rows in the main table, one of them silently
+    # re-labelled); at HORIZON == 1 turn 2 does not exist and the lookup would
+    # fail inside mechanism_meta_at_turn.  Gate it instead of hard-coding 2.
+    if HORIZON > 2:
+        second_tn = 2
+        results.append(("second_turn", _auction_at_turn("second_turn", second_tn), "untrained"))
+
+    # hindsight_bellman (information-relaxation UPPER BOUND, not "optimal")
+    hb_tn, _, _, _, _ = _run_policy_allocation(
+        "hindsight_bellman", dialogue, pctr_model, stop_policy,
+        force_auction_last_turn=force_auction_last_turn,
+        psi_mode="identity",
+        theta_max=DEFAULT_THETA_MAX,
+        gamma=gamma,
+    )
+    if hb_tn is not None:
+        results.append(("hindsight_bellman", _auction_at_turn("hindsight_bellman", hb_tn), "trained"))
+    else:
+        results.append(("hindsight_bellman", {"row": _no_trigger_row("hindsight_bellman", dialogue), "render_item": None}, "trained"))
+
+    # Matched refined-renderer timing controls are required for the main comparison.
+    matched = [("first_turn_trained_llm", first_turn)]
+    if HORIZON > 2:  # see the HORIZON gate above; keeps the arm list duplicate-free
+        matched.append(("second_turn_trained_llm", 2))
+    matched += [("last_turn_trained_llm", last_turn),
+                ("random_turn_trained_llm", chosen_turn)]
+    # Same-condition adaptive baseline: render the greedy myopic timing with the
+    # SAME refined renderer as learned_stop, so the learned-vs-myopic contrast
+    # isolates the stopping policy rather than the renderer.  myo_tn was chosen
+    # above from b_i*q_i >= MYOPIC_THRESHOLD; reuse that exact turn.
+    if myo_tn is not None:
+        matched.append(("myopic_threshold_trained_llm", myo_tn))
+    for pname, tn in matched:
+        results.append((pname, _auction_at_turn(pname, tn), "trained"))
+
     if include_ablation:
-        results.append(("first_turn_trained_llm", _auction_at_turn("first_turn_trained_llm", first_turn), "trained"))
         if chosen_tn is not None:
             results.append(("learned_stop_untrained_llm", _auction_at_turn("learned_stop_untrained_llm", chosen_tn), "untrained"))
         else:
@@ -823,6 +903,7 @@ def batch_evaluate(
     lambda_gamma, gamma, seed, force_auction_last_turn=True,
     include_ablation=False, eval_batch_size=8,
     vllm_trained_model=None, vllm_untrained_model=None, vllm_max_new_tokens=128,
+    renderer_temperature=0.0,
 ):
     """Two-phase evaluation: resolve auctions first, then batch-render LLM responses."""
     from tqdm import tqdm
@@ -835,6 +916,7 @@ def batch_evaluate(
     from src.eval.envelope_numerics import build_random_turn_map
     random_turn_map = build_random_turn_map(test_dialogues, seed)
     for d in tqdm(test_dialogues, desc="phase1: auction decisions"):
+        validate_dialogue(d)
         policy_results = _resolve_auction_for_policy(
             "batch", d, pctr_model, stop_policy, lambda_gamma, gamma,
             random_turn=random_turn_map[d["session_id"]],
@@ -877,7 +959,7 @@ def batch_evaluate(
             renderer_u = VLLMRenderer(
                 base_model=vllm_untrained_model,
                 max_new_tokens=vllm_max_new_tokens,
-                temperature=0.2, top_p=0.9,
+                temperature=renderer_temperature, top_p=0.9,
                 gpu_memory_utilization=0.45,
             )
             rendered = renderer_u.render_batch(untrained_items)
@@ -894,7 +976,7 @@ def batch_evaluate(
             renderer_t = VLLMRenderer(
                 base_model=vllm_trained_model,
                 max_new_tokens=vllm_max_new_tokens,
-                temperature=0.2, top_p=0.9,
+                temperature=renderer_temperature, top_p=0.9,
                 gpu_memory_utilization=0.45,
             )
             rendered = renderer_t.render_batch(trained_items)
@@ -930,6 +1012,7 @@ def batch_evaluate(
     rows = []
     for i, (pname, task, renderer_type) in enumerate(all_tasks):
         if "row" in task:
+            task["row"]["renderer_group"] = renderer_type
             rows.append(task["row"])
         else:
             p = task["row_partial"]
@@ -940,6 +1023,7 @@ def batch_evaluate(
                 p["result"], p["meta"], renderer, judge,
                 p["lambda_gamma"], gamma=p.get("gamma", gamma), pre_rendered_response=pre_response,
             )
+            row["renderer_group"] = renderer_type
             row["q_wait"] = p.get("q_wait", np.nan)
             row["q_auction"] = p.get("q_auction", np.nan)
             rows.append(row)

@@ -44,7 +44,7 @@ from src.eval.closed_loop_eval import (
     mechanism_meta_at_turn,
 )
 from src.models.text_mlp import PCTRModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 from src.utils.io import ensure_dir, load_jsonl, resolve_device
 
 
@@ -70,7 +70,7 @@ def per_turn_decision_trace(
         )
         if result is None:
             continue
-        features = stop_features_from_auction(tn, n_turns, meta)
+        features = stop_features_v2(tn, meta)
         q = stop_policy.q_values(features)
         q_wait = float(q[0])
         q_auction = float(q[1])

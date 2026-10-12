@@ -247,7 +247,7 @@ def main():
 
     # Also train stop policy using the bid-aware pCTR (for complete mechanism evaluation)
     log.info("Training Stop Policy (using bid-aware pCTR) ...")
-    from src.policy.stop_policy import StopState, stop_features_from_auction, train_stop_policy
+    from src.policy.stop_policy import StopState, stop_features_v2, train_stop_policy
     from src.auction.auction import run_quality_weighted_allocation
     from collections import defaultdict
 
@@ -282,7 +282,7 @@ def main():
                 "second_score": mech_result.second_score,
                 "payment": 0.0,
             }
-            features = stop_features_from_auction(tn, n_turns, auction_meta)
+            features = stop_features_v2(tn, auction_meta)
             states_by_session[d["session_id"]].append(StopState(
                 session_id=d["session_id"],
                 turn=tn,

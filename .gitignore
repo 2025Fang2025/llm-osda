@@ -3,3 +3,11 @@ outputs/
 data/*.jsonl
 __pycache__/
 *.pyc
+run_revision.local.sh
+
+.git/
+.pytest_cache/
+.env
+.env.*
+*.log
+*.zip

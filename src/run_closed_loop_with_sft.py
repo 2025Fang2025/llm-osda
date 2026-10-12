@@ -30,7 +30,7 @@ from src.eval.closed_loop_eval import (
 )
 from src.generation.sft_proxy import SoftInsertionRenderer
 from src.models.text_mlp import train_pctr_text_model, train_judge_text_model
-from src.policy.stop_policy import StopState, stop_features_from_auction, train_stop_policy
+from src.policy.stop_policy import StopState, stop_features_v2, train_stop_policy
 from src.user_simulator.judge_proxy import UserJudgeProxy
 from src.utils.io import ensure_dir, load_jsonl, save_json, resolve_device, set_seed
 
@@ -136,7 +136,7 @@ def build_stop_training_states(
             imm_reward, feedback = immediate_reward_for_train_state(
                 d, tn, result, auction_meta, renderer, judge_proxy, lambda_gamma=lambda_gamma
             )
-            features = stop_features_from_auction(tn, n_turns, auction_meta)
+            features = stop_features_v2(tn, auction_meta)
             auction_meta.update(feedback)
             states_by_session[d["session_id"]].append(StopState(
                 session_id=d["session_id"],

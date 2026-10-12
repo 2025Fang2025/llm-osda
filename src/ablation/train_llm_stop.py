@@ -40,7 +40,7 @@ from src.data.data_utils import (
 )
 from src.eval.closed_loop_eval import compute_pctrs_for_state
 from src.models.text_mlp import UnifiedUserModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 from src.auction.auction import run_quality_weighted_allocation
 from src.utils.io import ensure_dir, load_jsonl, save_json, save_jsonl, resolve_device, set_seed
 
@@ -104,7 +104,7 @@ def generate_stop_labels(
                 "second_score": mech_result.second_score,
                 "payment": 0.0,
             }
-            features = stop_features_from_auction(tn, n_turns, auction_meta)
+            features = stop_features_v2(tn, auction_meta)
             is_last = idx == len(turns) - 1
 
             if force_auction_last_turn and is_last:

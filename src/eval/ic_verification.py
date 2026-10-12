@@ -25,7 +25,7 @@ from src.eval.closed_loop_eval import (
     compute_global_critical_cpc,
 )
 from src.models.text_mlp import PCTRModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 
 
 BID_MULTIPLIERS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -62,7 +62,7 @@ def compute_cv_minus_winner(
         "second_score": sorted(scores_reduced, reverse=True)[1] if len(scores_reduced) > 1 else 0.0,
         "payment": 0.0,
     }
-    features_reduced = stop_features_from_auction(turn_number, n_turns, meta_reduced)
+    features_reduced = stop_features_v2(turn_number, meta_reduced)
     q_vals = stop_policy.q_values(features_reduced)
     return max(0.0, float(q_vals[0]))
 

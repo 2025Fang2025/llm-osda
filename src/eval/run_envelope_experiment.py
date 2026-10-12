@@ -71,6 +71,7 @@ def find_winner_for_session(
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity",
         theta_max=theta_max,
+        gamma=gamma,
     )
     if chosen_turn is None or result is None:
         return None
@@ -84,6 +85,7 @@ def find_winner_for_session(
         force_auction_last_turn=force_auction_last_turn,
         psi_mode="identity",
         theta_max=theta_max,
+        gamma=gamma,
     )
 
     return {
@@ -259,8 +261,12 @@ def run_envelope_experiment(
         if not turn_audit.empty and (
             turn_audit["first_turn"] == turn_audit["random_turn"]
         ).all():
-            raise RuntimeError(
-                "random_turn is identical to first_turn for every matched session"
+            # Equality is mandatory for T=1 and can occur by chance in a
+            # finite multi-turn sample. Validate against the frozen random
+            # schedule above, not against another policy's observed choices.
+            log.info(
+                "random_turn matches first_turn for every matched session; "
+                "this is expected for T=1 and is not a replay error"
             )
 
     # Save results

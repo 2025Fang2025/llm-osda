@@ -31,7 +31,7 @@ from src.eval.closed_loop_eval import compute_pctrs_for_state
 from src.eval.ic_verification import run_ic_verification, summarize_ic_results
 from src.eval.pctr_ablation import ABLATION_VARIANTS, build_pctr_ablation_data
 from src.models.text_mlp import PCTRModel, train_pctr_text_model
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 from src.utils.io import ensure_dir, load_jsonl, save_json, resolve_device, set_seed
 
 

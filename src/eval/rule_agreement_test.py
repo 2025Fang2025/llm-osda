@@ -33,7 +33,7 @@ from src.eval.closed_loop_eval import (
     compute_pctrs_for_state,
 )
 from src.models.text_mlp import UnifiedUserModel
-from src.policy.stop_policy import StopPolicy, stop_features_from_auction
+from src.policy.stop_policy import StopPolicy, stop_features_v2
 from src.utils.io import ensure_dir, load_jsonl, resolve_device, save_json
 
 
@@ -51,7 +51,7 @@ def bellman_stop_bit(
     )
     if result is None:
         return "WAIT"
-    features = stop_features_from_auction(turn_number, n_turns, meta)
+    features = stop_features_v2(turn_number, meta)
     q = stop_policy.q_values(features)
     # q[0] = Q_wait, q[1] = Q_auction. auction dominates -> STOP.
     return "STOP" if float(q[1]) >= float(q[0]) else "WAIT"
